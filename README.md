@@ -49,4 +49,4 @@ and a written report, but no code. This is optimal to see the plots and tables.
 
 2. **Rmarkdown** CompetitivePokemon-datacleaningandEDA.Rmd contains all code. 
 
-  * Ensure all libraries in the setup chunk are installed in order to run the code.
+  * Ensure all libraries in the setup chunk are installed in order to run the code."# Competitive-Pokemon-EDA" 
