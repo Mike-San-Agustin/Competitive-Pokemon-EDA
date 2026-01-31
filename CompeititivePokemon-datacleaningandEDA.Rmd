@@ -1,0 +1,531 @@
+---
+title: "Data Wrangling - Final Project"
+author: "Michael San Agustin"
+date: "2025-05-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#WARNING: Loading the chunk from line 140 may take awhile, approximately 30 seconds. Running and knitting the whole document may take around 60 to 90 seconds. 
+library(vroom)
+library(ggplot2)
+library(tidyverse)
+library(stringr)
+library(rvest)
+library(purrr)
+library(jsonlite)
+library(ggbeeswarm)
+library(readr)
+library(robotstxt)
+library(broom)
+library(plotly)
+```
+
+# Pokemon Analysis
+
+**Key Findings**
+
+-   Finding: Stat totals are not the sole predictor of usage; abilities like Regenerator and items like Heavy Duty Boots create viability for lower-stat Pokemon.
+
+-   Finding: Typing significantly impacts stat distribution (p \< 0.0001 per MANOVA).
+
+In this report, we will take a quick look at data involving typing, combat stats, height, weight, and competitive usage of Pokemon. Pokemon that can be thought of like chess or a card game. Each person has a team of 6 Pokemon which are chosen out of over 1000 Pokemon. Turns happen in discrete-time in which a person can have their Pokemon use a move or switch their Pokemon to one from their reserves. The "chess" aspect comes from the moveset, combat statistics, item and abilities. It is mostly through data and experience, that a player can deduce information and decide what is the best move.
+
+In essence, this paper will try to answer, which Pokemon dominate competitive play, and why? Understanding usage patterns can reveal balance issues and strategic trends. In other words, understanding these trends will allow players to make data-driven decisions on selecting pokemon.
+
+## 1. Data Retrieval and Preparing it
+
+As the title says, in this section I will explain how data was scraped. There will be 2 data sets: competitive data and game data. Competitive data can be found from smogons website <https://www.smogon.com/stats/>. Game data can be found from <https://pokeapi.co/docs/v2#pokemon-section>.
+
+### 1a. Competitive data
+
+Competitive data comes from Pokemon Showdown, a simulator of the competitive Pokemon. Competitive Pokemon uses a tiering system to allow every Pokemon to be playable. The tiers we will analyze are the highest played and the most competitively viable Pokemon. These are the Uber, Overused (OU), and underused (UU) tiers. As you may expect, they are based on usage data. Pokemon in lower tiers can be played in higher tiers but the reverse is not true. Uber Pokemon are manually chosen to be banned by a council on the forums, this is to prevent every team "requiring" to use the Uber-tier Pokemon to even be stand a chance.
+
+For every Pokemon, this dataset has everything from teammates that work well to the top performing move sets. However, for our analysis the variables of interest are the top performing abilities and items. Also, we are interested in count and usage data of these particular combinations. I created a list of URLs, a function to parse the data from the URL and then iterated over the list using the map function.
+
+```{r Reading_in_comp_data, echo=FALSE}
+#Parser function 
+AIU_extract <- function(i){
+  X <- fromJSON(i)$data
+  Pokemon <- X |> names()
+  AIU_data <- data.frame(
+    Pokemon = Pokemon,
+     ability = Pokemon |>
+      map_chr(~  pluck(X,.x,"Abilities")|> names() |> pluck(1)), 
+    
+    items = Pokemon |>
+      map_chr(~  pluck(X,.x,"Items" )|> names() |> pluck(1)),
+    
+    count = Pokemon |>
+      map_dbl(~  pluck(X,.x,"Raw count")),
+    
+    usage = Pokemon |>
+      map_dbl(~  pluck(X, .x,"usage"))
+  )
+  return(AIU_data)
+}
+
+#List of URLs
+comp_URLs <- list(
+  "https://www.smogon.com/stats/2025-04/chaos/gen9ou-1825.json", #OU data - standard tier
+  "https://www.smogon.com/stats/2025-04/chaos/gen9uu-1760.json", #UU data - slightly lower usage pokemon,
+  "https://www.smogon.com/stats/2025-04/chaos/gen9ubers-1760.json" #Uber data - if left unbanned, would dominate OU
+  )
+
+#Iterate over URLs - seperated for clarity
+gen9_comp <- comp_URLs |>
+  map_dfr(AIU_extract)
+
+#Present it to our reader
+head(gen9_comp)
+```
+
+A quick rundown of the variables in this dataset:
+
+-   **Pokemon** - the name of the Pokemon. EX: Pikachu
+
+-   **Ability** - the Pokemon's most used ability or passive boost. Ex: static - taking a physical hit may paralyze to the attacker.
+
+-   **Items** - the item that is paired most with the Pokemon. Ex: Light ball - if the holder is Pikachu, double its attacking stat.
+
+-   **Count** - how many players included this pokemon on their team.
+
+-   **Usage** - proportion of teams that included this Pokemon. There can be 6 Pokemon on a team so this wont necessarily add up to 1.0
+
+Since Pokemon are allowed to be played in tiers higher than its own, I suspected there would be a lot of overlap. This is a problem because Pokemon can have completely different set ups depending on the tier that its playing in. I fixed this by grouping by Pokemon, and using slice_max to order by count. Then I took only the top result. While I was at it, I changed the Pokemon names to match some missing cases in the game data.
+
+```{r Unique_check, echo=FALSE}
+n_unique <- gen9_comp |> summarise(unique_names = n_distinct(Pokemon))
+n_row <- nrow(gen9_comp)
+
+gen9_comp <- gen9_comp |>
+  group_by(Pokemon) |>
+  mutate(Pokemon = str_to_lower(Pokemon) |> str_replace_all(" ","-")) |>
+  slice_max(order_by = count, n = 1) |>
+  ungroup()
+
+gen9_comp |> arrange(desc(count))|> pull(Pokemon) |> head()
+```
+
+### 1b. Game data
+
+Next, I needed to gather game data from PokeAPI. The data was provided in a JSON format, and conveniently, PokeAPI also included a data frame of Pokémon along with URLs linking to their corresponding data files. Since I am only interested in the Pokémon from our competitive dataset, I pulled the Pokemon column and used it to filter the relevant URLs from the data frame. After that, I downloaded each file and parsed the contents. Similarly to competitive data, I needed to build a parser function to extract the desired elements. I began by retrieving the appropriate URLs. I also want to note that the API does not require a key.
+
+```{r Retrieving_list_of_URLs, echo=FALSE}
+#List of Pokemon
+names <- gen9_comp |> #other data has pokemon in lower case
+  _[["Pokemon"]] 
+
+#List of URLs
+gen9_URLs <- fromJSON("https://pokeapi.co/api/v2/pokemon?limit=10000") |> 
+  _[["results"]] |>
+  filter(name %in% names) |>
+  pull(url) 
+```
+
+In order to extract the data cleanly, I built a parser function and then iterated over the list of URLs. The function was designed to take a URL and extract the corresponding JSON file, which is structured as a nested list. Using the pluck function to index into this structure, I was able to retrieve the specific elements. Also using, data.frame() and pivot_wider() I was able to turn variables that were lists, into a row matrix to conform with the rest of the data.
+
+```{r Statfunction, echo=FALSE}
+stats_extract <- function(url){
+  X <- fromJSON(url)
+  Q <-data.frame(
+    Pokemon = X |> pluck("name"), 
+    weight = X |> pluck("weight"),
+    height = X |> pluck("height"),
+    
+    X |> pluck("stats","base_stat") |> 
+      data.frame(stat_name = c("hp", "attack", "defense", "sp_attack", "sp_defense", "speed")) |> 
+      rename(stat_value = pluck.X...stats....base_stat..) |> 
+      pivot_wider(names_from = stat_name, values_from = stat_value), #list to row
+    
+    X |> pluck("types","type","name")|> 
+      data.frame(Type_name = c("Type_1", "Type_2")) |> 
+      rename(Type_value = pluck.X...types....type....name..) |> 
+      pivot_wider(names_from = Type_name, values_from = Type_value) #list to row
+  )
+   #Sys.sleep(0.5)
+  return(Q)
+}
+```
+
+Then I applied the scraper function to the list of Pokemon and acheived the following result:
+
+```{r Applying_function_to_URLs, echo=FALSE}
+#WARNING: I am not sure of the download speed of the computer, as well as how much time you're willing to wait for this extraction. The dataframe took 32 seconds to extract on my PC. I have included a downloaded file of the result of this code chunk as of gen9_game, which can be read in if preferred.
+
+gen9_game <- gen9_URLs |> 
+  map_dfr(stats_extract)
+
+head(gen9_game)
+```
+
+I extracted the following:
+
+-   **Pokemon** - name
+
+-   **Base stats** - combat stats that determine damage dealt and damage taken. Ex: HP, attack, defense, special defense, special attack, speed
+
+-   **Type1/type2** - elemental type Ex: electric, fire, water, etc
+
+-   **Weight**
+
+-   **Height**
+
+### 1c. Data Cleaning, Joining, Preprocessing
+
+Finally, after gathering the data I used a left_join() starting with the game data. This allows the join to filter those that are only in the game data, so we can expect no missing rows. The following is the result and contains all our variables and data.
+
+```{r Finally - the join chunk, echo=FALSE}
+gen9_full <- gen9_game |>
+  left_join(gen9_comp, by = join_by(Pokemon))
+#gen9_full |> slice_max(order_by = count, n = 6)
+#gen9_full |> filter(!if_any(everything(),is.na))
+head(gen9_full)
+```
+
+## 2. Data Visualization and Analysis
+
+In this section are the following:
+
+2a. Stat total analysis
+
+2b. Histogram of the top 30 abilities and items
+
+### 2a. Stat total analysis
+
+We will start by visualizing the combat stat data using principal component analysis (PCA). To explain briefly, PCA rewrites our combat stat variable space into linear combinations that captures that much of the variance is captured in a few axis. First we can calculate the proportion of this variance that is preserved by each principal component.
+
+```{r PCA-1, message=FALSE, warning=FALSE, echo =  FALSE}
+PVE_gen9 <- gen9_full |> 
+  select(where(is.numeric), -usage, -weight, -height, -count)|> 
+  #mutate(count = log(count), weight = log(weight)) |> 
+  scale() |> 
+  prcomp() |> 
+  pluck("sdev")
+
+tidy(PVE_gen9^2/sum(PVE_gen9^2))
+
+```
+
+Due to low correlation, the first principal component only captures about 24% of our data structure. However, the first three captures 65% of the variance which is enough for a visualization, but arguably not enough to model on. Performing this transformation on our data results in a 3-dimensional plot, which was graphed using plot_ly(). Plot_ly has an easier time handling 3-dimensional data.
+
+```{r PCA-2, message=FALSE, warning=FALSE, echo =  FALSE}
+scores  <- gen9_full |>
+  select(where(is.numeric), -usage, -weight, -height, -count) |>
+  scale() |>
+  prcomp() |>
+  pluck("x") 
+
+new_coords <- scores |> as.data.frame() |> select(PC1, PC2, PC3)
+
+gen9_full |> cbind(new_coords) |> 
+  plot_ly(
+    x = ~PC1, 
+    y = ~PC2,
+    z = ~PC3,
+    type = "scatter3d",
+    mode = "markers",
+    text = ~Pokemon, 
+    color = ~Type_1,
+    colorscale = "Viridis"
+  )
+```
+
+This plot is also interactive, and allows for the zoom functionality. The viewer can also click on the types on the right to remove them for the plot.
+
+Our combat stats have a ball shape with a few outliers. In the coding of the game, the maximum base statistic a Pokemon can have for any of its combat stats is 255. Only a Pokemon named Blissey has a combat stat of 255 (hp), and is not typically used because other tanks outclass it. One outlier is Deoxys-attack which has 150 attack, special attack, and speed, which is obviously very strong. If we look on the negative axis of PC3, we see two Pokemon named Magikarp and Smeargle. Magikarp is a Pokemon that is used as a placeholder, or as a joke. It doesn't learn any moves and has low combat stats. Smeargle on the other hand has the ability to learn any move and was used much more in previous generations. With the banning of his ability, he dropped in usage but is still viable. The Pokemon outside of the "ball" have multiple high or low stats, which is rare.
+
+Now We can graph a histogram of the total stats, a metric that is useful to compare the viability of all Pokemon despite their specific role (tank, bruiser, offensive threat, support, etc).
+
+```{r Distribution of Total Stats, echo=FALSE}
+p_stat_total <- gen9_full |>
+  mutate(stat_total = hp + attack + defense + sp_attack + sp_defense + speed) |>
+  ggplot(aes(x = stat_total)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Total Stats",
+       x = "Combat Stat Total")
+p_stat_total
+
+p_stat_total + facet_wrap(~Type_1)
+```
+
+Combat stat total is a typical metric that summarizes all of the combat stats. We see that it is approximately normal with a skew towards higher values. If playing competitively, most players tend to use Pokemon with higher stat_totals. The question that logically follows is if types tend to have different stat totals, or if combat stats themselves seem to differ from each other. To answer this I set up a multiple analysis of variance test with the null hypothesis of equal means across stats.
+
+```{r Manova, echo=FALSE}
+manova_model <- manova(cbind(hp, attack, defense, sp_attack, sp_defense, speed) ~ Type_1, data = gen9_full)
+tidy(manova_model , test = "Wilks")
+```
+
+Our Wilk's lambda has a p-value less than 0.0001 we would reject the null hypothesis that all Pokemon types have the same average profile across base stats. This suggest at least one type differs significantly in its overall combination of stats.
+
+Typically we can continue with univariate anova, comparing each stat across type_1. However, for simplicity, I will highlight some trends that are common. Electric type Pokemon tend to have a high speed and high special attacking stat, but lack in defenses. Fire type Pokemon tend to have a high special attacking stat and fall into an attacking role or a slower supportive role with higher defenses. Water, ground, and steel Pokemon are known to be bulky tanks that take hits with high hp and defensive stats.
+
+### 2b. Abilities and items plot
+
+While stat totals tend to be a good indicator of competitive viability, it is not the only metric. Abilities and items have significant value that can make low-stat Pokemon viable, which will be illustrated by the following graph.
+
+```{r usage by stat classification, echo = FALSE}
+p1 <- gen9_full |> 
+  arrange(desc(count)) |> 
+  rowwise() |> 
+  mutate(
+    stat_total = hp + attack + defense + sp_attack + sp_defense + speed,
+    x = case_when(
+    max(c_across(c(hp, attack, defense, sp_attack, sp_defense, speed))) > 125 ~ 'Elite' ,
+    max(c_across(c(hp, attack, defense, sp_attack, sp_defense, speed))) > 110  ~ 'Mid-tier', 
+    .default = 'Standard'), 
+    fill_type = Type_1
+) |>
+  ungroup() |>
+  ggplot(aes(
+  x = Type_1, 
+  y = count, 
+  fill  = fill_type,
+  text = paste("Name:", Pokemon)
+  ))  + 
+  geom_beeswarm(color = NA) + 
+  scale_fill_manual(
+    name = "Type",
+    values = c(
+      normal   = "#A8A77A",
+      fire     = "#EE8130",
+      water    = "#6390F0",
+      electric = "#F7D02C",
+      grass    = "#7AC74C",
+      ice      = "#96D9D6",
+      fighting = "#C22E28",
+      poison   = "#A33EA1",
+      ground   = "#E2BF65",
+      flying   = "#A98FF3",
+      psychic  = "#F95587",
+      bug      = "#A6B91A",
+      rock     = "#B6A136",
+      ghost    = "#735797",
+      dragon   = "#6F35FC",
+      dark     = "#705746",
+      steel    = "#B7B7CE",
+      fairy    = "#D685AD"
+    )
+  ) +
+  labs(
+    title = "Pokemon Count by Stat Classification",
+    x = "Type",
+    y = "Count"
+  ) +
+  facet_wrap(~x) + 
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    axis.title.x = element_blank()
+    )
+
+
+ggplotly(p1, tooltip = "text") 
+```
+
+The plot above displays count by Pokemon typing faceted by stat classification. The classification here is that if a Pokemon possesses a stat that is over 125, that would be considered high and is assigned a 1. If the highest stat is between 110 and 125, then it's assigned a 2. If all stats are below 110 then it is considered a low-stat Pokemon and assigned a 3. From the graph we can observe that Pokemon with extremely high usage tend to be in group 1. However, we still see the peaks of the low-stat group matching the peaks of the moderate stats, which indicate that stats are not the only consideration when making a competitive team. The peaks of group 1 tend to be all-around great Pokemon with little weaknesses, which include stat totals.
+
+Let's see what the most used abilities are and the most used items are, and I will describe what some of them do to illustrate their purpose.
+
+```{r Finally - Abilities Histogram, echo=FALSE}
+gen9_full |> 
+  group_by(ability) |> 
+  summarise(total_count = sum(count))|> 
+  arrange(desc(total_count)) |> 
+  slice_head(n = 30) |> 
+  ggplot(aes(
+    x = reorder(ability, total_count, decreasing = TRUE),
+    y = total_count
+    )) + 
+  geom_col(
+    fill = "steelblue",
+    color = "white"
+    )+
+  labs(
+    y = "Count of Pokemon Using the Item",
+    x = "Ability",
+    title = "Distribution of the 30 Most Used Abilities"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+As we can see, few abilities really dominate the scene competitively. Some of them are coincidental, like Protosynthesis and Quark Drive. These abilities are given to new "legendary" Pokemon and boost their highest stat by a 1.5x multiplier at the cost of having an item. Basically, the ability takes an already good Pokemon, and lets it hit hard right away without having to waste a turn to boosts its own stats.
+
+Likewise, Pressure is here because it is given to most legendary Pokemon. Pokemon's moves have a limited amount of uses per battle. While a Pokemon with Pressure is on the field, these uses drain by 2 instead of 1.
+
+Regenerator allows a Pokemon to... regenerate their health if it is switched out. This allows annoying tanks and support Pokemon to stay in the game much longer than they otherwise would.
+
+Good as gold is a unique ability and is only given to Gholdengo. It prevents status moves from hitting him. Gholdengo is the culmination of amazing stats, typing, and one of the strongest moves in the game right now. Coupled with this ability it gains flexibility being supportive or offensive powerhouse. This flexibiility is what can make Pokemon very unpredictable.
+
+Despite protosynthesis and quark drive being offensively driven abilities, the majority of these abilities are actually more defensive or supportive than offensive.
+
+Now let's continue with the item histogram.
+
+```{r Finally - Item Histogram, echo=FALSE}
+gen9_full |> 
+  group_by(items) |> 
+  summarise(total_count = sum(count))|> 
+  arrange(desc(total_count)) |> 
+  slice_head(n = 30) |> 
+  ggplot(aes(
+    x = reorder(items, total_count, decreasing = TRUE),
+    y = total_count)
+    ) + 
+  geom_col(
+    fill = "steelblue",
+    color = "white"
+    ) +
+  labs(
+    y = "Count of Pokemon Using the Item",
+    x = "Item",
+    title = "Distribution of the 30 Most Used Items"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Heavy duty boots being at the top is not surprising. In Pokemon, a common strategy is laying down "entry hazards" which damage a Pokemon upon switching in. Heavy duty boots ignores any entry hazard damage and this is useful for Pokemon who are very weak to entry hazards. For example, a flying type switching into a "stealth rock" entry hazard takes 25% of its health as damage; a massive disadvantage.
+
+Leftovers has been one of the best items for years. It regenerates 1/16th of a Pokemon's HP per turn and is typically given to tanks and bruiser Pokemon. These Pokemon can take hits and therefore are the main ones that can benefit from this item.
+
+Assault Vest gives Pokemon a 1.5x Special Defense boost but the user can only use attacking moves. Similarly, this item is reversed for tanks. Typically they have the regenerator ability which is the one of the only way a Pokemon with this item can heal themselves (due to the item's restriction).
+
+Booster Energy is the item paired with Protosynthesis and Quark Drive abilities. As mentioned before, if a Pokemon has these abilities, this item simply activates the passive.
+
+## 3. Interpretaion and Great Tusk
+
+Like many hierarchies in real life, the strongest Pokemon tend to dominate competitive and usage statistics. After all, that was the reason for Smogon implementing a tiering system in the first place: to prevent homogeneity in teams. We have analyzed usage by abilities, items, type and combat stats and see that all of these variables dictate usage statistics. If a Pokemon:
+
+1.  has high stats,
+
+2.  has a good ability,
+
+3.  can effectively utilize a good item,
+
+4.  and has a good type matching its play style,
+
+It will dominate. In fact, what is the Pokemon with the highest usage?
+
+```{r Great-Tusk, echo = FALSE}
+gen9_full |> 
+  arrange(desc(count)) |>
+  select(-weight, -height) |>
+  slice_head()
+```
+
+Almost comically, Great Tusk exemplifies all of these attributes. Its almost as if he was designed by the game developers to be abused as much as he is. He has a 33.6% usage which is unheard of in previous generations. It possess great stats, the protosynthesis ability, and a great tank typing in ground/fighting. This typing allows it to be bulky while maintaining access to strong offensive and stat boosting fighting type moves. Also, eject pack is the only item listed here (which switches the Great Tusk out if he gets hit), but it can effectively use many different of the best items. Some of the items typically used (from my experience) include booster energy, heavy duty boots, leftovers and assault vest, which are the most used items. Great Tusk is a versatile threat and fills many roles in the team.
+
+In conclusion, combat statistics are typically one of the first, and sometimes only consideration when players choose a Pokemon for their team. However, they are not sufficient enough for a Pokemon to be viable. Abilities, items, and typing are equally as important.
+
+## 4. Further Analysis
+
+This report includes a key statistical test with significant result: a multivariate analysis of variance on combat stats. This analysis was also exploratory, but some players may be interested in some models that can arise from it.
+
+1.  The significant MANOVA results indicate that Pokemon base stats differ across typing. This justifies proceedings with univariate ANOVA for each stat to determine where these differences lie. If the univariate tests also yield significant results, other testing like Tukey's HSD or clustering techniques can also be used to explore patterns.
+
+2.  Combat stat totals were also seemingly distributed normally and perhaps a vector of combat stats (Stat_vec = c(hp, attack, defense, sp_attack, sp_defense, speed)) is a multivariate normal variable. This would require Box M's tests and Mahalanobis distance scatterplot to test normality. After confirming multivariate normality, we can conduct further analysis with Hotellings T-squared test or bonferroni adjusted confidence intervals. Thus, we can make a confidence band for Pokemon types in these higher usage tiers.
+
+3.  Another potential direction is predicting Uber-tier classification using supervised learning methods. Techniques such as random forests, neural networks, discriminant analysis, and logistic regression could be applied using features like combat stats, abilities, items, and typing. This analysis was not pursued due to data limitations but remains a promising avenue.
+
+We can go in multiple directions if we chose to include all tiers, all generations (gen 1 is still being played to this day), and a few years of data. While I chose not to include these due to computational load (around 30-40 minutes load time for about 6 months of OU data), this analysis would greatly benefit from it. Overall, this report serves as a foundational exploration and can be developed further.
+
+```{r Save_data , echo = FALSE}
+gen9_full |>
+write.csv("Pokemon_gen9_4-25.csv")
+```
+
+## 5. Easter egg - Height and weight plots
+
+Heights and weights, don't really have weight (haha) in competitive Pokemon. Theres one move that is named grass knot that deals damage based on weight but other moves that use this data are rare to see. However, it could still be interesting to analyze the distribution of heights and weights. I am keeping the units in game units because there doesn't seem to be an official conversion formula. By my own calculations it would seem one height unit is 1/2 of a meter. Also 1 weight unit is about 1/5 of a kilogram. Lets graph height and weight.
+
+```{r Finally - height weight scatter, echo=FALSE}
+p_1 <- gen9_full |>
+  #mutate(height = log(height), weight = log(weight)) |> 
+  ggplot(aes(
+    x = weight, 
+    y = height, 
+    fill = Type_1,
+    text = paste("Name:", Pokemon)
+    ))  + 
+  geom_point(color = "black", stroke = 0.30) + 
+  scale_fill_manual(
+    name = "Type",
+    values = c(
+      normal   = "#A8A77A",
+      fire     = "#EE8130",
+      water    = "#6390F0",
+      electric = "#F7D02C",
+      grass    = "#7AC74C",
+      ice      = "#96D9D6",
+      fighting = "#C22E28",
+      poison   = "#A33EA1",
+      ground   = "#E2BF65",
+      flying   = "#A98FF3",
+      psychic  = "#F95587",
+      bug      = "#A6B91A",
+      rock     = "#B6A136",
+      ghost    = "#735797",
+      dragon   = "#6F35FC",
+      dark     = "#705746",
+      steel    = "#B7B7CE",
+      fairy    = "#D685AD"
+    )
+  ) 
+  ggplotly(p_1,tooltip = "text")
+```
+
+The graph is colored by type and is interactive. When hovered, you can see the name of the Pokemon. Also, there is a zoom and panning functionality that can be useful to get a closer look. We see that the majority of Pokemon are near the origin but theres one Pokemon that is clearly an outlier on the top right. This is Eternatus, an alien dragon that so massive it changes the gravitational pull and masses of the Pokemon next to it. The data seems to follow an exponential trend so I transformed height and weight by taking the logs and graphed again:
+
+```{r Finally - log trasnformed scatterplot, echo=FALSE }
+p_1_log<- gen9_full |>
+  mutate(height = log(height), weight = log(weight)) |> 
+  ggplot(aes(
+    x = weight, 
+    y = height, 
+    fill = Type_1,
+    text = paste("Name:", Pokemon)
+    )) +
+  geom_point(color = "black", stroke = 0.3) +
+  scale_fill_manual(
+    name = "Type",
+    values = c(
+      normal   = "#A8A77A",
+      fire     = "#EE8130",
+      water    = "#6390F0",
+      electric = "#F7D02C",
+      grass    = "#7AC74C",
+      ice      = "#96D9D6",
+      fighting = "#C22E28",
+      poison   = "#A33EA1",
+      ground   = "#E2BF65",
+      flying   = "#A98FF3",
+      psychic  = "#F95587",
+      bug      = "#A6B91A",
+      rock     = "#B6A136",
+      ghost    = "#735797",
+      dragon   = "#6F35FC",
+      dark     = "#705746",
+      steel    = "#B7B7CE",
+      fairy    = "#D685AD"
+    )) +
+  labs(
+    x = "Weight"
+  )
+
+  ggplotly(p_1_log, tooltip = "text")
+```
+
+The graph here clearly shows a linear trend and so I thought it may be interesting to see a regression on the log transformed variables.
+
+```{r Finally - Regression of height vs weight, echo=FALSE }
+height_weight_reg <- gen9_full |>
+  mutate(height = log(height), weight = log(weight)) |>
+  lm(height ~ weight, data = _)
+tidy(height_weight_reg)      
+glance(height_weight_reg)
+```
+
+To quickly interpret our results, we have a p-value much less than 0.001, which implies our beta coefficient for weight is significant. With a coeffecient of 0.3733, this means that for every 1% increase in weight there is a 0.3733% increase in height on average.
+
+In the second table, we see that our r-squared and adjusted r-squared is around 0.68 which implies that around 68% of the variation in height is explained by weight. It seems that Pokémon designers follow an implicit rule: heavier Pokémon tend to be taller; aligning with our real world. With nearly 70% of the variation in height explained by weight, this suggests a fairly consistent body proportion system, even in a world of floating ghosts and electric mice. Whether this is due to design constraints, aesthetic balance, or subconscious bias — the trend is clearly there.
