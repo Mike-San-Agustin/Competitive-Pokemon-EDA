@@ -4,7 +4,7 @@ This project analyes the "meta-game" of Pokemon Generation 9 competitive play. B
 
 This project demonstrates a complete data science lifecycle: Web Scraping, API integration, Data Cleaning, Multivariate Statistical Testing, and Ineteractive visualization.
 
-Key Insights
+**Key Insights**
 
 -   **The "Stats" Fallacy:** While High base stats generally correlate with usage, specific abilities
 (ex: *Regenerator*) and items (ex: *Heavy-Duty Boots*) allow lower-stat Pokemon to remain
